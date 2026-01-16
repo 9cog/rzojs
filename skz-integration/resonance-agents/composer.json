@@ -1,0 +1,40 @@
+{
+    "name": "skz/resonance-agents",
+    "description": "7 Autonomous Agents for Academic Publishing using Resonance Framework",
+    "type": "project",
+    "license": "MIT",
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "require": {
+        "php": ">=8.2",
+        "distantmagic/resonance": "^0.35",
+        "ext-ds": "*",
+        "ext-swoole": "*"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^1.10",
+        "phpunit/phpunit": "^10.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "SKZ\\Agents\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "SKZ\\Agents\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true,
+        "allow-plugins": {
+            "php-http/discovery": true
+        }
+    },
+    "scripts": {
+        "serve": "php bin/resonance.php serve",
+        "test": "phpunit",
+        "analyze": "phpstan analyse src --level=8"
+    }
+}
