@@ -11,6 +11,7 @@ use SKZ\Agents\Message\AgentMessage;
 use SKZ\Agents\Message\MessageType;
 use SKZ\Agents\Service\MemoryService;
 use SKZ\Agents\Service\DecisionEngine;
+use Swoole\Coroutine;
 
 /**
  * Workflow Orchestration Agent
@@ -34,32 +35,101 @@ class WorkflowOrchestrationAgent extends BaseAgent
     private array $activeWorkflows = [];
 
     /**
+     * Optimized workflow templates with parallel execution support
      * @var array<string, array<string, mixed>>
      */
     private array $workflowTemplates = [
         'new_submission' => [
             'stages' => [
-                ['agent' => 'manuscript_analysis', 'action' => 'full_analysis', 'timeout' => 3600],
-                ['agent' => 'editorial_decision', 'action' => 'triage_submission', 'timeout' => 1800],
-                ['agent' => 'peer_review_coordination', 'action' => 'find_reviewers', 'timeout' => 7200],
+                // Stage 1: Parallel manuscript analysis tasks
+                [
+                    'parallel' => true,
+                    'tasks' => [
+                        ['agent' => 'manuscript_analysis', 'action' => 'format_check', 'timeout' => 1800],
+                        ['agent' => 'manuscript_analysis', 'action' => 'plagiarism_detection', 'timeout' => 2700],
+                        ['agent' => 'manuscript_analysis', 'action' => 'statistical_review', 'timeout' => 1800],
+                    ],
+                    'timeout' => 3600,
+                ],
+                // Stage 2: Editorial triage (sequential - needs analysis results)
+                ['agent' => 'editorial_decision', 'action' => 'triage_submission', 'timeout' => 1800, 'early_exit' => true],
+                // Stage 3: Parallel reviewer search and context gathering
+                [
+                    'parallel' => true,
+                    'tasks' => [
+                        ['agent' => 'peer_review_coordination', 'action' => 'find_reviewers', 'timeout' => 7200],
+                        ['agent' => 'research_discovery', 'action' => 'gather_context', 'timeout' => 3600],
+                    ],
+                    'timeout' => 7200,
+                ],
             ],
-            'estimated_duration' => 24,
+            'estimated_duration' => 12, // Reduced from 24 with parallelization
+            'priority_boost' => ['high_impact', 'invited_submission'],
         ],
         'review_complete' => [
             'stages' => [
-                ['agent' => 'quality_assurance', 'action' => 'assess_scientific_quality', 'timeout' => 3600],
+                // Stage 1: Parallel quality assessments
+                [
+                    'parallel' => true,
+                    'tasks' => [
+                        ['agent' => 'quality_assurance', 'action' => 'scientific_validity', 'timeout' => 3600],
+                        ['agent' => 'quality_assurance', 'action' => 'methodology_assessment', 'timeout' => 3600],
+                        ['agent' => 'manuscript_analysis', 'action' => 'statistical_rigor', 'timeout' => 2400],
+                    ],
+                    'timeout' => 3600,
+                ],
+                // Stage 2: Review aggregation
+                ['agent' => 'editorial_decision', 'action' => 'aggregate_reviews', 'timeout' => 3600],
+                // Stage 3: Final decision synthesis
                 ['agent' => 'editorial_decision', 'action' => 'make_decision', 'timeout' => 7200],
             ],
-            'estimated_duration' => 48,
+            'estimated_duration' => 24, // Reduced from 48 with parallelization
         ],
         'accepted_manuscript' => [
             'stages' => [
-                ['agent' => 'publication_formatting', 'action' => 'format_manuscript', 'timeout' => 7200],
-                ['agent' => 'publication_formatting', 'action' => 'generate_metadata', 'timeout' => 1800],
-                ['agent' => 'quality_assurance', 'action' => 'full_qa_review', 'timeout' => 3600],
-                ['agent' => 'publication_formatting', 'action' => 'multi_format_export', 'timeout' => 3600],
+                // Stage 1: Parallel production preparation
+                [
+                    'parallel' => true,
+                    'tasks' => [
+                        ['agent' => 'publication_formatting', 'action' => 'format_manuscript', 'timeout' => 7200],
+                        ['agent' => 'publication_formatting', 'action' => 'generate_metadata', 'timeout' => 1800],
+                        ['agent' => 'research_discovery', 'action' => 'verify_references', 'timeout' => 3600],
+                    ],
+                    'timeout' => 7200,
+                ],
+                // Stage 2: Quality assurance gate (sequential checkpoint)
+                ['agent' => 'quality_assurance', 'action' => 'full_qa_review', 'timeout' => 7200],
+                // Stage 3: Parallel multi-format export
+                [
+                    'parallel' => true,
+                    'tasks' => [
+                        ['agent' => 'publication_formatting', 'action' => 'export_pdf', 'timeout' => 1800],
+                        ['agent' => 'publication_formatting', 'action' => 'export_html', 'timeout' => 1800],
+                        ['agent' => 'publication_formatting', 'action' => 'export_jats_xml', 'timeout' => 2400],
+                        ['agent' => 'publication_formatting', 'action' => 'register_doi', 'timeout' => 1200],
+                    ],
+                    'timeout' => 3600,
+                ],
             ],
-            'estimated_duration' => 72,
+            'estimated_duration' => 36, // Reduced from 72 with parallelization
+        ],
+        'revision_requested' => [
+            'stages' => [
+                // Stage 1: Track revision submission
+                ['agent' => 'manuscript_analysis', 'action' => 'diff_analysis', 'timeout' => 1800],
+                // Stage 2: Parallel re-assessment
+                [
+                    'parallel' => true,
+                    'tasks' => [
+                        ['agent' => 'quality_assurance', 'action' => 'verify_revisions', 'timeout' => 3600],
+                        ['agent' => 'peer_review_coordination', 'action' => 'notify_reviewers', 'timeout' => 1800],
+                    ],
+                    'timeout' => 3600,
+                ],
+                // Stage 3: Re-review decision
+                ['agent' => 'editorial_decision', 'action' => 'revision_decision', 'timeout' => 7200],
+            ],
+            'estimated_duration' => 18,
         ],
     ];
 
@@ -408,33 +478,208 @@ class WorkflowOrchestrationAgent extends BaseAgent
         if ($stageIndex >= count($workflow['stages'])) {
             $workflow['status'] = 'completed';
             $workflow['completed_at'] = time();
+            $this->logger->info("Workflow completed", ['workflow_id' => $workflowId]);
             return;
         }
 
         $stage = $workflow['stages'][$stageIndex];
         $workflow['current_stage'] = $stageIndex;
 
-        // Send task to the target agent
-        $agents = $this->messageBroker->findAgentsByCapability(
-            AgentCapability::from($stage['action'])
+        // Check if this is a parallel stage
+        if (isset($stage['parallel']) && $stage['parallel'] === true) {
+            $this->executeParallelTasks($workflowId, $stageIndex, $stage['tasks']);
+            return;
+        }
+
+        // Check for early exit condition
+        if (isset($stage['early_exit']) && $stage['early_exit']) {
+            $workflow['can_early_exit'] = true;
+        }
+
+        // Sequential execution - send task to the target agent
+        $this->dispatchToAgent($workflowId, $stageIndex, $stage);
+    }
+
+    /**
+     * Execute multiple tasks in parallel using Swoole coroutines
+     *
+     * @param string $workflowId
+     * @param int $stageIndex
+     * @param array<array<string, mixed>> $tasks
+     */
+    private function executeParallelTasks(string $workflowId, int $stageIndex, array $tasks): void
+    {
+        $workflow = &$this->activeWorkflows[$workflowId];
+        $parallelResults = [];
+        $taskCount = count($tasks);
+        $completedCount = 0;
+
+        $this->logger->info("Executing parallel stage", [
+            'workflow_id' => $workflowId,
+            'stage_index' => $stageIndex,
+            'task_count' => $taskCount,
+        ]);
+
+        // Initialize parallel tracking
+        $workflow['parallel_tracking'][$stageIndex] = [
+            'total' => $taskCount,
+            'completed' => 0,
+            'results' => [],
+            'started_at' => time(),
+        ];
+
+        // Dispatch all tasks in parallel
+        foreach ($tasks as $taskIndex => $task) {
+            $this->dispatchToAgent($workflowId, $stageIndex, $task, $taskIndex);
+        }
+    }
+
+    /**
+     * Dispatch a task to the appropriate agent
+     *
+     * @param string $workflowId
+     * @param int $stageIndex
+     * @param array<string, mixed> $task
+     * @param int|null $parallelTaskIndex
+     */
+    private function dispatchToAgent(string $workflowId, int $stageIndex, array $task, ?int $parallelTaskIndex = null): void
+    {
+        $workflow = &$this->activeWorkflows[$workflowId];
+        $action = $task['action'];
+
+        // Find suitable agent using load-balanced selection
+        $agents = $this->findBestAgentForTask($task);
+
+        if (empty($agents)) {
+            $this->logger->warning("No suitable agent found for task", [
+                'workflow_id' => $workflowId,
+                'action' => $action,
+            ]);
+            return;
+        }
+
+        $targetAgent = $agents[0];
+
+        $message = new AgentMessage(
+            senderId: $this->id,
+            recipientId: $targetAgent->getId(),
+            type: MessageType::COMMAND,
+            content: [
+                'type' => $action,
+                'workflow_id' => $workflowId,
+                'stage_index' => $stageIndex,
+                'parallel_task_index' => $parallelTaskIndex,
+                'context' => $workflow['context'],
+                'timeout' => $task['timeout'] ?? 3600,
+            ],
         );
 
-        if (!empty($agents)) {
-            $targetAgent = $agents[0];
+        $this->sendMessage($message);
+    }
 
-            $message = new AgentMessage(
-                senderId: $this->id,
-                recipientId: $targetAgent->getId(),
-                type: MessageType::COMMAND,
-                content: [
-                    'type' => $stage['action'],
-                    'workflow_id' => $workflowId,
-                    'stage_index' => $stageIndex,
-                    'context' => $workflow['context'],
-                ],
-            );
+    /**
+     * Find the best agent for a task using load balancing
+     *
+     * @param array<string, mixed> $task
+     * @return array<AgentInterface>
+     */
+    private function findBestAgentForTask(array $task): array
+    {
+        $agentType = $task['agent'] ?? '';
+        $action = $task['action'] ?? '';
 
-            $this->sendMessage($message);
+        // Get all agents of the required type
+        $allAgents = $this->messageBroker->getAgents();
+        $candidates = [];
+
+        foreach ($allAgents as $agent) {
+            // Match by agent type name
+            $typeName = strtolower(str_replace('_', '', $agent->getType()->value));
+            $targetType = strtolower(str_replace('_', '', $agentType));
+
+            if (strpos($typeName, $targetType) !== false) {
+                $health = $agent->getHealth();
+                $metrics = $agent->getMetrics();
+
+                // Calculate agent score for load balancing
+                $score = $this->calculateAgentScore($health, $metrics);
+                $candidates[] = ['agent' => $agent, 'score' => $score];
+            }
+        }
+
+        // Sort by score (highest first)
+        usort($candidates, fn($a, $b) => $b['score'] <=> $a['score']);
+
+        return array_map(fn($c) => $c['agent'], $candidates);
+    }
+
+    /**
+     * Calculate agent selection score for load balancing
+     *
+     * @param array<string, mixed> $health
+     * @param array<string, mixed> $metrics
+     * @return float
+     */
+    private function calculateAgentScore(array $health, array $metrics): float
+    {
+        $score = 0.0;
+
+        // Health factor (40%)
+        $healthScore = ($health['healthy'] ?? false) ? 1.0 : 0.0;
+        $score += $healthScore * 0.4;
+
+        // Load factor - prefer less loaded agents (30%)
+        $queueSize = $metrics['queue_size'] ?? 0;
+        $loadScore = max(0.0, 1.0 - ($queueSize / 10.0));
+        $score += $loadScore * 0.3;
+
+        // Performance factor (30%)
+        $avgTime = $metrics['avg_processing_time'] ?? 1.0;
+        $speedScore = min(1.0, 1.0 / max(0.1, $avgTime));
+        $score += $speedScore * 0.3;
+
+        return $score;
+    }
+
+    /**
+     * Handle completion of a parallel task
+     *
+     * @param string $workflowId
+     * @param int $stageIndex
+     * @param int $taskIndex
+     * @param array<string, mixed> $result
+     */
+    public function handleParallelTaskComplete(string $workflowId, int $stageIndex, int $taskIndex, array $result): void
+    {
+        if (!isset($this->activeWorkflows[$workflowId])) {
+            return;
+        }
+
+        $workflow = &$this->activeWorkflows[$workflowId];
+        $tracking = &$workflow['parallel_tracking'][$stageIndex];
+
+        $tracking['results'][$taskIndex] = $result;
+        $tracking['completed']++;
+
+        $this->logger->info("Parallel task completed", [
+            'workflow_id' => $workflowId,
+            'stage_index' => $stageIndex,
+            'task_index' => $taskIndex,
+            'completed' => $tracking['completed'],
+            'total' => $tracking['total'],
+        ]);
+
+        // Check if all parallel tasks are complete
+        if ($tracking['completed'] >= $tracking['total']) {
+            // Aggregate results
+            $workflow['stage_results'][$stageIndex] = [
+                'parallel' => true,
+                'results' => $tracking['results'],
+                'duration' => time() - $tracking['started_at'],
+            ];
+
+            // Move to next stage
+            $this->executeWorkflowStage($workflowId, $stageIndex + 1);
         }
     }
 

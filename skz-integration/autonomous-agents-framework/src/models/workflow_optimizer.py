@@ -92,20 +92,110 @@ class OptimizationResult:
 
 class WorkflowOptimizer:
     """Advanced workflow optimization and coordination system"""
-    
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.active_workflows = {}
         self.agent_resources = {}
         self.task_queue = []
         self.performance_history = defaultdict(list)
-        
+
         # Optimization parameters
         self.optimization_weights = {
             'completion_time': 0.4,
             'resource_efficiency': 0.3,
             'success_probability': 0.2,
             'cost_optimization': 0.1
+        }
+
+        # Parallel execution configuration
+        self.parallel_config = {
+            'max_concurrent_tasks': 5,
+            'min_parallel_batch_size': 2,
+            'parallel_timeout_multiplier': 1.2,
+        }
+
+        # Workflow templates optimized for parallel execution
+        self.optimized_templates = {
+            'new_submission': {
+                'stages': [
+                    {
+                        'name': 'parallel_analysis',
+                        'parallel': True,
+                        'tasks': ['format_check', 'plagiarism_detection', 'statistical_review'],
+                        'agents': ['manuscript_analysis'],
+                        'timeout': 3600,
+                    },
+                    {
+                        'name': 'editorial_triage',
+                        'parallel': False,
+                        'tasks': ['triage_submission'],
+                        'agents': ['editorial_decision'],
+                        'timeout': 1800,
+                        'early_exit': True,
+                    },
+                    {
+                        'name': 'parallel_preparation',
+                        'parallel': True,
+                        'tasks': ['find_reviewers', 'gather_context'],
+                        'agents': ['peer_review_coordination', 'research_discovery'],
+                        'timeout': 7200,
+                    },
+                ],
+                'estimated_hours': 12,
+            },
+            'review_complete': {
+                'stages': [
+                    {
+                        'name': 'parallel_quality',
+                        'parallel': True,
+                        'tasks': ['scientific_validity', 'methodology_assessment', 'statistical_rigor'],
+                        'agents': ['quality_assurance', 'manuscript_analysis'],
+                        'timeout': 3600,
+                    },
+                    {
+                        'name': 'review_aggregation',
+                        'parallel': False,
+                        'tasks': ['aggregate_reviews'],
+                        'agents': ['editorial_decision'],
+                        'timeout': 3600,
+                    },
+                    {
+                        'name': 'decision_synthesis',
+                        'parallel': False,
+                        'tasks': ['make_decision'],
+                        'agents': ['editorial_decision'],
+                        'timeout': 7200,
+                    },
+                ],
+                'estimated_hours': 24,
+            },
+            'accepted_manuscript': {
+                'stages': [
+                    {
+                        'name': 'parallel_production',
+                        'parallel': True,
+                        'tasks': ['format_manuscript', 'generate_metadata', 'verify_references'],
+                        'agents': ['publication_formatting', 'research_discovery'],
+                        'timeout': 7200,
+                    },
+                    {
+                        'name': 'qa_gate',
+                        'parallel': False,
+                        'tasks': ['full_qa_review'],
+                        'agents': ['quality_assurance'],
+                        'timeout': 7200,
+                    },
+                    {
+                        'name': 'parallel_export',
+                        'parallel': True,
+                        'tasks': ['export_pdf', 'export_html', 'export_jats_xml', 'register_doi'],
+                        'agents': ['publication_formatting'],
+                        'timeout': 3600,
+                    },
+                ],
+                'estimated_hours': 36,
+            },
         }
         
     async def optimize_workflow(self, workflow: WorkflowDefinition, available_agents: List[AgentResource]) -> OptimizationResult:
@@ -509,9 +599,9 @@ class WorkflowOptimizer:
     
     async def _identify_runtime_bottlenecks(self, workflow_data: Dict[str, Any]) -> List[str]:
         """Identify runtime bottlenecks in active workflow"""
-        
+
         bottlenecks = []
-        
+
         # Find stuck tasks (running too long)
         current_time = datetime.now()
         for task in workflow_data.get('tasks', []):
@@ -520,10 +610,10 @@ class WorkflowOptimizer:
                 if start_time:
                     runtime = (current_time - datetime.fromisoformat(start_time)).total_seconds() / 60
                     expected_duration = task.get('estimated_duration', 30)
-                    
+
                     if runtime > expected_duration * 1.5:
                         bottlenecks.append(f"Task {task['task_id']} running longer than expected")
-        
+
         # Find dependency blockers
         pending_tasks = [t for t in workflow_data.get('tasks', []) if t.get('status') == WorkflowStatus.PENDING]
         for task in pending_tasks:
@@ -532,11 +622,185 @@ class WorkflowOptimizer:
                 dep_task = next((t for t in workflow_data['tasks'] if t['task_id'] == dep_id), None)
                 if dep_task and dep_task.get('status') != WorkflowStatus.COMPLETED:
                     unmet_deps.append(dep_id)
-            
+
             if unmet_deps:
                 bottlenecks.append(f"Task {task['task_id']} blocked by dependencies: {unmet_deps}")
-        
+
         return bottlenecks
+
+    async def identify_parallelizable_tasks(self, workflow: WorkflowDefinition) -> List[List[str]]:
+        """Identify groups of tasks that can be executed in parallel"""
+
+        dependency_graph = await self._build_dependency_graph(workflow.tasks)
+        parallel_groups = []
+
+        if not nx.is_directed_acyclic_graph(dependency_graph):
+            logger.warning("Workflow contains cycles, cannot parallelize")
+            return [[task.task_id] for task in workflow.tasks]
+
+        # Group tasks by their dependency depth level
+        topo_order = list(nx.topological_sort(dependency_graph))
+        task_levels = {}
+
+        for task_id in topo_order:
+            predecessors = list(dependency_graph.predecessors(task_id))
+            if not predecessors:
+                task_levels[task_id] = 0
+            else:
+                task_levels[task_id] = max(task_levels[p] for p in predecessors) + 1
+
+        # Group tasks by level (same level = can run in parallel)
+        max_level = max(task_levels.values()) if task_levels else 0
+        for level in range(max_level + 1):
+            level_tasks = [tid for tid, lvl in task_levels.items() if lvl == level]
+            if level_tasks:
+                parallel_groups.append(level_tasks)
+
+        return parallel_groups
+
+    async def optimize_parallel_schedule(
+        self,
+        workflow: WorkflowDefinition,
+        agents: List[AgentResource],
+        max_parallel: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Generate an optimized schedule with parallel execution"""
+
+        parallel_groups = await self.identify_parallelizable_tasks(workflow)
+        schedule = []
+        current_time = 0
+
+        # Track agent availability
+        agent_next_free = {agent.agent_id: 0 for agent in agents}
+
+        for group in parallel_groups:
+            group_tasks = [t for t in workflow.tasks if t.task_id in group]
+            group_schedule = []
+
+            # Sort tasks by priority (highest first)
+            group_tasks.sort(key=lambda t: t.priority.value, reverse=True)
+
+            # Limit parallelism
+            batch_size = min(len(group_tasks), max_parallel)
+            batches = [group_tasks[i:i + batch_size] for i in range(0, len(group_tasks), batch_size)]
+
+            for batch in batches:
+                batch_start = current_time
+                batch_entries = []
+
+                for task in batch:
+                    best_agent = await self._find_best_agent(task, agents, agent_next_free)
+                    if best_agent:
+                        start_time = max(batch_start, agent_next_free.get(best_agent.agent_id, 0))
+                        end_time = start_time + task.estimated_duration
+
+                        entry = {
+                            'task_id': task.task_id,
+                            'agent_id': best_agent.agent_id,
+                            'start_time': start_time,
+                            'end_time': end_time,
+                            'duration': task.estimated_duration,
+                            'priority': task.priority.value,
+                            'parallel_group': group,
+                            'batch_index': batches.index(batch),
+                        }
+                        batch_entries.append(entry)
+                        agent_next_free[best_agent.agent_id] = end_time
+
+                if batch_entries:
+                    schedule.extend(batch_entries)
+                    current_time = max(e['end_time'] for e in batch_entries)
+
+        schedule.sort(key=lambda x: (x['start_time'], -x['priority']))
+        return schedule
+
+    async def calculate_workflow_metrics(self, workflow: WorkflowDefinition, schedule: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Calculate comprehensive workflow metrics"""
+
+        if not schedule:
+            return {
+                'total_duration': 0,
+                'parallelization_factor': 0,
+                'agent_utilization': {},
+                'critical_path_length': 0,
+                'efficiency_score': 0,
+            }
+
+        total_duration = max(e['end_time'] for e in schedule)
+        sequential_duration = sum(t.estimated_duration for t in workflow.tasks)
+
+        # Parallelization factor (1.0 = fully sequential, higher = more parallel)
+        parallelization_factor = sequential_duration / total_duration if total_duration > 0 else 1.0
+
+        # Agent utilization
+        agent_busy_time = defaultdict(int)
+        for entry in schedule:
+            agent_busy_time[entry['agent_id']] += entry['duration']
+
+        agent_utilization = {
+            agent_id: busy_time / total_duration
+            for agent_id, busy_time in agent_busy_time.items()
+        }
+
+        # Average utilization across all agents
+        avg_utilization = sum(agent_utilization.values()) / len(agent_utilization) if agent_utilization else 0
+
+        # Efficiency score combines parallelization and utilization
+        efficiency_score = (parallelization_factor * 0.6) + (avg_utilization * 0.4)
+
+        return {
+            'total_duration': total_duration,
+            'sequential_duration': sequential_duration,
+            'time_saved': sequential_duration - total_duration,
+            'parallelization_factor': round(parallelization_factor, 2),
+            'agent_utilization': agent_utilization,
+            'avg_utilization': round(avg_utilization, 3),
+            'efficiency_score': round(min(1.0, efficiency_score), 3),
+            'task_count': len(schedule),
+        }
+
+    async def suggest_workflow_improvements(self, workflow: WorkflowDefinition, metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate actionable workflow improvement suggestions"""
+
+        suggestions = []
+
+        # Low parallelization
+        if metrics.get('parallelization_factor', 1.0) < 1.5:
+            suggestions.append({
+                'type': 'parallelization',
+                'severity': 'medium',
+                'message': 'Low parallelization detected. Consider breaking down dependent tasks.',
+                'potential_gain': '20-40% time reduction',
+            })
+
+        # Low utilization
+        if metrics.get('avg_utilization', 1.0) < 0.5:
+            suggestions.append({
+                'type': 'resource_optimization',
+                'severity': 'low',
+                'message': 'Agent utilization below 50%. Consider consolidating agent pool.',
+                'potential_gain': 'Cost reduction',
+            })
+
+        # High utilization warning
+        if metrics.get('avg_utilization', 0) > 0.9:
+            suggestions.append({
+                'type': 'capacity_warning',
+                'severity': 'high',
+                'message': 'Agent utilization above 90%. Consider adding capacity for resilience.',
+                'potential_gain': 'Improved reliability',
+            })
+
+        # Long total duration
+        if metrics.get('total_duration', 0) > 1440:  # > 24 hours
+            suggestions.append({
+                'type': 'duration_optimization',
+                'severity': 'medium',
+                'message': 'Workflow duration exceeds 24 hours. Review bottleneck stages.',
+                'potential_gain': 'Faster turnaround',
+            })
+
+        return suggestions
 
 
 # Utility functions
